@@ -1,0 +1,114 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.artifact_name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Native builds on both architectures — GitHub-hosted arm64 Linux
+          # runners are available for public repos, so this needs neither
+          # `cross` nor QEMU cross-compilation (the Docker workflow already
+          # proves QEMU works here if a target ever needs it instead).
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+            artifact_name: linux-x86_64-gnu
+            expect_arch: x86-64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            artifact_name: linux-aarch64-gnu
+            expect_arch: ARM aarch64
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Verify binary architecture
+        # Cross-compilation mistakes (wrong target, stale cache, etc.) tend
+        # to produce a binary that happens to run on the build host but is
+        # the wrong architecture for where it'll actually be deployed —
+        # `file` reports the real ELF machine type, so assert it explicitly
+        # rather than trusting `cargo build --target` alone.
+        run: |
+          BIN=target/${{ matrix.target }}/release/resque-bench
+          file "$BIN"
+          file "$BIN" | grep -q "${{ matrix.expect_arch }}" || {
+            echo "::error::expected '${{ matrix.expect_arch }}' in file(1) output for $BIN"
+            exit 1
+          }
+          # Smoke-test: the binary must at least run and print its version —
+          # proves it's not just the right architecture but actually
+          # executable (this step runs natively on both x86_64 and the
+          # aarch64 hosted runner, so this is a real execution, not a
+          # cross-arch no-op).
+          "$BIN" --version
+
+      - name: Package tarball
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          STAGE="resque-bench-${VERSION}-${{ matrix.artifact_name }}"
+          mkdir -p "$STAGE"
+          cp target/${{ matrix.target }}/release/resque-bench "$STAGE/"
+          cp LICENSE "$STAGE/"
+          cp README.md "$STAGE/"
+          tar czf "${STAGE}.tar.gz" "$STAGE"
+          sha256sum "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256"
+          ls -la "${STAGE}.tar.gz" "${STAGE}.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: |
+            resque-bench-*.tar.gz
+            resque-bench-*.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Verify checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          ls -la
+          for f in *.sha256; do
+            sha256sum -c "$f"
+          done
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          generate_release_notes: true
+          fail_on_unmatched_files: true

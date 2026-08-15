@@ -24,6 +24,22 @@ pub async fn flushdb(conn: &mut redis::aio::MultiplexedConnection) -> Result<()>
     Ok(())
 }
 
+/// Sum of LLEN across all benchmark queue keys. Used to verify the queue is
+/// truly empty before trusting the idle-poll measurement phase — see
+/// `main.rs::run` doc comment on the drain→idle-poll transition for why a
+/// drain-phase timeout with leftover backlog must never be treated as "empty".
+pub async fn total_queue_len(
+    conn: &mut redis::aio::MultiplexedConnection,
+    queues: &[String],
+) -> Result<u64> {
+    let mut pipe = redis::pipe();
+    for queue in queues {
+        pipe.cmd("LLEN").arg(format!("queue:{queue}"));
+    }
+    let lens: Vec<u64> = pipe.query_async(conn).await?;
+    Ok(lens.iter().sum())
+}
+
 /// Bulk-enqueue `n_jobs` Resque jobs distributed round-robin across `queues`.
 ///
 /// Uses **RPUSH** — matching `Resque::DataStore::QueueAccess#push_to_queue`

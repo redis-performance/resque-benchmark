@@ -62,6 +62,13 @@ pub fn print_trial_line(r: &TrialResult) {
 /// headline new metric — Resque has no blocking dequeue, so idle workers
 /// generate a steady LPOP poll-storm rather than zero traffic.
 pub fn print_idle_poll_line(r: &IdlePollResult) {
+    if let Some(reason) = &r.skipped_reason {
+        println!(
+            "  [{:>4} workers]  idle-poll: SKIPPED — {reason}",
+            r.workers
+        );
+        return;
+    }
     println!(
         "  [{:>4} workers]  idle-poll: {:>10} LPOP/s  ({:.1} LPOP/s/worker over {:.1}s, {} calls)",
         r.workers,
@@ -112,6 +119,16 @@ pub fn print_idle_poll_summary(results: &[IdlePollResult]) {
         "LPOP/s/worker",
     ]);
     for r in results {
+        if r.skipped_reason.is_some() {
+            table.add_row(vec![
+                Cell::new(r.workers),
+                Cell::new("SKIPPED"),
+                Cell::new("-"),
+                Cell::new("-"),
+                Cell::new("-"),
+            ]);
+            continue;
+        }
         table.add_row(vec![
             Cell::new(r.workers),
             Cell::new(format!("{:.1}", r.duration_s)),
@@ -169,6 +186,12 @@ struct JsonIdlePoll {
     total_lpop_calls: u64,
     idle_poll_qps: f64,
     per_worker_qps: f64,
+    /// Set when the idle-poll phase was NOT run because the queue could not
+    /// be verified empty after the drain phase (e.g. it hit --timeout with
+    /// backlog remaining). All other fields in this object are 0 when set —
+    /// consumers must check this before trusting idle_poll_qps.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    skipped_reason: Option<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -229,6 +252,7 @@ pub fn write_json(
                     } else {
                         0.0
                     },
+                    skipped_reason: idle.skipped_reason.clone(),
                 },
             })
             .collect(),

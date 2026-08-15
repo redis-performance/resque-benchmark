@@ -114,9 +114,14 @@ impl PollWorker {
         match serde_json::from_str::<ResqueJob>(payload) {
             Ok(job) => match ResqueJob::enqueued_at_ns(&job.args) {
                 Some(enqueued_at_ns) => {
+                    // Same rationale as job.rs::ResqueJob::new: a clock reading
+                    // before the epoch is a host misconfiguration, not something
+                    // a malformed queue payload can trigger — but a poll worker
+                    // panicking mid-run would silently drop out of the fleet
+                    // without ever reporting an error, so fail soft instead.
                     let now_ns = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
-                        .expect("system clock is before UNIX_EPOCH")
+                        .unwrap_or_default()
                         .as_nanos() as u64;
                     let latency_us = if now_ns >= enqueued_at_ns {
                         (now_ns - enqueued_at_ns) / 1_000

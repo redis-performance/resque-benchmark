@@ -39,8 +39,17 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Unit tests
+      - name: Unit + integration tests
+        # tests/idle_poll_integration.rs drives real PollWorker/producer code
+        # against the `redis` service above (db 15, distinct from the smoke
+        # test's db 0 below) — enqueues real jobs, drains them with real
+        # workers, and asserts idle_poll_qps lands within tolerance of
+        # workers * 1000 / poll_interval_ms as an automated regression
+        # check, plus a MONITOR-based check that only LPOP/RPUSH ever hit
+        # the wire (no blocking variant).
         run: cargo test
+        env:
+          REDIS_URL: redis://127.0.0.1:6379/15
 
       - name: Smoke test (end-to-end against Redis service)
         run: |

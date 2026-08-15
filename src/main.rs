@@ -1,13 +1,8 @@
-mod job;
-mod metrics;
-mod producer;
-mod report;
-mod worker;
-
 use anyhow::{Context, Result};
 use clap::Parser;
 use hdrhistogram::Histogram;
 use metrics::{IdlePollResult, LatencyStats, Metrics, TrialResult};
+use resque_bench::{metrics, producer, report, worker};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -121,8 +116,8 @@ struct Cli {
 // ── Redis URL helpers ─────────────────────────────────────────────────────────
 
 fn build_redis_url(cli: &Cli) -> Result<String> {
-    let mut u =
-        url::Url::parse(&cli.url).with_context(|| format!("invalid Redis URL: {}", cli.url))?;
+    let mut u = url::Url::parse(&cli.url)
+        .with_context(|| format!("invalid Redis URL: {}", redact_url(&cli.url)))?;
 
     if let Some(host) = &cli.host {
         u.set_host(Some(host))
@@ -130,16 +125,18 @@ fn build_redis_url(cli: &Cli) -> Result<String> {
     }
     if let Some(port) = cli.port {
         u.set_port(Some(port))
-            .map_err(|_| anyhow::anyhow!("cannot set port on URL: {}", cli.url))?;
+            .map_err(|_| anyhow::anyhow!("cannot set port on URL: {}", redact_url(&cli.url)))?;
     }
     if cli.tls && u.scheme() == "redis" {
         u.set_scheme("rediss")
             .map_err(|_| anyhow::anyhow!("cannot upgrade scheme to rediss"))?;
     }
     if let Some(password) = &cli.password {
-        // url::Url::set_password percent-encodes special characters (e.g. '@', '/', ':')
+        // url::Url::set_password percent-encodes special characters (e.g. '@', '/', ':').
+        // NOTE: the error path below must never echo `password` — only the (already
+        // redacted) base URL — since printing the raw value would leak the secret.
         u.set_password(Some(password))
-            .map_err(|_| anyhow::anyhow!("cannot set password on URL: {}", cli.url))?;
+            .map_err(|_| anyhow::anyhow!("cannot set password on URL: {}", redact_url(&cli.url)))?;
     }
     // Ensure db path is present
     if u.path().trim_matches('/').is_empty() {
@@ -232,10 +229,25 @@ fn parse_percentile_spec(s: &str) -> Result<PercentileSpec> {
         s if s.starts_with('p') => {
             let digits = &s[1..];
             anyhow::ensure!(!digits.is_empty(), "invalid percentile spec: '{s}'");
+            // A crafted --latency-percentiles value with ~20 digits (e.g.
+            // "p10000000000000000000", which still parses fine as a u64 —
+            // u64::MAX itself has 20 digits) makes `10u64.pow(digits.len())`
+            // overflow: 10^20 > u64::MAX. `pow` panics on overflow in debug
+            // builds and silently wraps in release, either way turning a
+            // malformed CLI flag into a crash or a bogus quantile instead of
+            // a clean error. Cap the digit count well under that threshold
+            // (no real percentile spec needs more than a handful of nines)
+            // and use checked_pow as defense in depth.
+            anyhow::ensure!(
+                digits.len() <= 15,
+                "percentile spec '{s}' has too many digits (max 15) — use e.g. p99, p999, p99999"
+            );
             let n: u64 = digits
                 .parse()
                 .with_context(|| format!("invalid percentile spec: '{s}'"))?;
-            let divisor = 10u64.pow(digits.len() as u32);
+            let divisor = 10u64
+                .checked_pow(digits.len() as u32)
+                .ok_or_else(|| anyhow::anyhow!("percentile spec '{s}' out of range"))?;
             let q = n as f64 / divisor as f64;
             anyhow::ensure!(q > 0.0 && q <= 1.0, "percentile out of range (0, 1]: '{s}'");
             Ok(PercentileSpec::Quantile {
@@ -330,12 +342,32 @@ async fn open_worker_connections(
 
 /// Await a batch of worker JoinHandles, giving each up to `grace` to notice a
 /// shutdown signal and return; anything still running past that is aborted.
+///
+/// Each handle is watched CONCURRENTLY (one tiny supervisor task per worker),
+/// not sequentially. A worker only fails to notice the shutdown watch signal
+/// promptly if it's blocked mid-flight inside a `query_async` call that never
+/// returns (e.g. Redis wedged / network partition) — the shutdown select! in
+/// `PollWorker::run` otherwise reacts near-instantly regardless of
+/// `--poll-interval-ms`. If that happens to ALL n workers at once (Redis
+/// disappearing mid-benchmark is exactly the scenario where it would), a
+/// naive sequential await would take up to `n_workers * grace` to finish —
+/// e.g. 200 workers * 5s = ~17 minutes — before the program could proceed to
+/// the next trial or exit. Concurrent awaiting bounds total wall time at
+/// `grace` regardless of how many workers are stuck.
 async fn join_workers(handles: Vec<tokio::task::JoinHandle<()>>, grace: Duration) {
-    for h in handles {
-        let abort = h.abort_handle();
-        if tokio::time::timeout(grace, h).await.is_err() {
-            abort.abort();
-        }
+    let waiters: Vec<_> = handles
+        .into_iter()
+        .map(|h| {
+            tokio::spawn(async move {
+                let abort = h.abort_handle();
+                if tokio::time::timeout(grace, h).await.is_err() {
+                    abort.abort();
+                }
+            })
+        })
+        .collect();
+    for w in waiters {
+        let _ = w.await;
     }
 }
 
@@ -521,6 +553,37 @@ async fn run_drain_trial(cfg: &TrialConfig<'_>, n_workers: usize) -> Result<Tria
 
 // ── Idle-poll trial (steady-state polling load against an empty queue) ───────
 
+/// Derive fleet-wide and per-worker idle-poll QPS from the raw counters.
+/// Pulled out of `run_idle_poll_trial` as a pure function so the boundary
+/// cases (zero duration, zero workers, huge counters) are unit-testable
+/// without spinning up real workers/Redis:
+/// - `duration_s <= 0.0`: guards not just literal 0.0 but also NaN/negative,
+///   returning (0.0, 0.0) instead of a division that could produce `inf`/NaN
+///   masquerading as a real throughput figure downstream (JSON, table
+///   printing). `--idle-poll-duration-s` is separately validated to be > 0
+///   in `validate_cli`, but this function stays defensive on its own since
+///   it's also reachable with an arbitrary caller-supplied `duration_s`.
+/// - `total_calls` is a u64 counter incremented once per LPOP issued; even
+///   at the maximum realistic sustained rate (millions/sec) for the maximum
+///   realistic trial length, it stays far below 2^53 (the point where an
+///   f64 can no longer represent every integer exactly), so the
+///   `as f64` conversion here never silently loses precision in practice.
+/// - `workers == 0` guards the per-worker division; `validate_cli` also
+///   rejects a 0 in `--workers` up front, so this is defense in depth.
+fn compute_idle_poll_qps(total_calls: u64, duration_s: f64, workers: usize) -> (f64, f64) {
+    let idle_poll_qps = if duration_s.is_finite() && duration_s > 0.0 {
+        total_calls as f64 / duration_s
+    } else {
+        0.0
+    };
+    let per_worker_qps = if workers > 0 {
+        idle_poll_qps / workers as f64
+    } else {
+        0.0
+    };
+    (idle_poll_qps, per_worker_qps)
+}
+
 async fn run_idle_poll_trial(
     url: &str,
     queue_keys: &[String],
@@ -567,16 +630,8 @@ async fn run_idle_poll_trial(
 
     let total_lpop_calls = metrics.get_polls();
     let duration_s = elapsed.as_secs_f64();
-    let idle_poll_qps = if duration_s > 0.0 {
-        total_lpop_calls as f64 / duration_s
-    } else {
-        0.0
-    };
-    let per_worker_qps = if n_workers > 0 {
-        idle_poll_qps / n_workers as f64
-    } else {
-        0.0
-    };
+    let (idle_poll_qps, per_worker_qps) =
+        compute_idle_poll_qps(total_lpop_calls, duration_s, n_workers);
 
     Ok(IdlePollResult {
         workers: n_workers,
@@ -584,18 +639,74 @@ async fn run_idle_poll_trial(
         total_lpop_calls,
         idle_poll_qps,
         per_worker_qps,
+        skipped_reason: None,
     })
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
+/// Validate CLI arguments that clap's type system can't express (all-zero
+/// checks, cross-field sanity) and print any non-fatal advisory warnings.
+/// Split out from `main` so it's independently unit-testable.
+fn validate_cli(cli: &Cli) -> Result<()> {
+    anyhow::ensure!(cli.jobs > 0, "--jobs must be > 0");
+    anyhow::ensure!(cli.num_queues > 0, "--num-queues must be > 0");
+    anyhow::ensure!(cli.timeout > 0, "--timeout must be > 0");
+    // idle_poll_qps = total_lpop_calls / duration_s uses the REAL elapsed
+    // wall time, not the requested duration — with --idle-poll-duration-s 0
+    // that elapsed time is a near-zero (but not exactly zero) scheduling
+    // epsilon, so the `duration_s > 0.0` guard in run_idle_poll_trial would
+    // NOT catch it: a handful of polls divided by a sub-millisecond window
+    // extrapolates to a wildly inflated, meaningless QPS figure that still
+    // looks like a real result. Reject the degenerate input instead.
+    anyhow::ensure!(
+        cli.idle_poll_duration_s > 0,
+        "--idle-poll-duration-s must be > 0"
+    );
+    // A literal 0 here would make every empty-queue poll cycle sleep for
+    // Duration::ZERO — tokio::time::sleep(ZERO) yields once and returns
+    // immediately, so this would busy-loop LPOP calls against Redis as fast
+    // as the network round-trip allows (a self-inflicted DoS on both this
+    // process and the target Redis) rather than measuring any real steady
+    // -state polling rate. Reject it outright instead of silently producing
+    // a number that looks like a benchmark result.
+    anyhow::ensure!(cli.poll_interval_ms > 0, "--poll-interval-ms must be > 0");
+    anyhow::ensure!(
+        !cli.workers.is_empty(),
+        "--workers must list at least one concurrency level"
+    );
+    anyhow::ensure!(
+        cli.workers.iter().all(|&w| w > 0),
+        "--workers values must all be > 0 — a 0-worker trial can never reach \
+         its target completion count, so it silently hangs for the full \
+         --timeout instead of failing fast"
+    );
+    if cli.poll_interval_ms < 10 {
+        eprintln!(
+            "warning: --poll-interval-ms {} is very aggressive — each idle worker will issue \
+             up to ~{} LPOP/s against Redis (Resque's own out-of-the-box default is 5000ms). \
+             This is a legitimate stress-test mode, but make sure it's intentional before \
+             pointing it at shared infrastructure.",
+            cli.poll_interval_ms,
+            1000 / cli.poll_interval_ms.max(1),
+        );
+    }
+    if let Some(&max_workers) = cli.workers.iter().max() {
+        if max_workers > 5000 {
+            eprintln!(
+                "warning: --workers {max_workers} opens one dedicated Redis connection PER \
+                 worker — this may exhaust file descriptors / ephemeral ports on this machine, \
+                 or `maxclients` on the Redis server. Check `ulimit -n` before running."
+            );
+        }
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-
-    anyhow::ensure!(cli.jobs > 0, "--jobs must be > 0");
-    anyhow::ensure!(cli.num_queues > 0, "--num-queues must be > 0");
-    anyhow::ensure!(cli.poll_interval_ms > 0, "--poll-interval-ms must be > 0");
+    validate_cli(&cli)?;
 
     let url = build_redis_url(&cli)?;
     let display_url = redact_url(&url);
@@ -719,25 +830,48 @@ async fn main() -> Result<()> {
         }
         report::print_trial_line(&result);
 
-        // Idle-poll phase — queue is now empty (drained or timed out with
-        // best-effort completion); measure steady-state polling load. Run
-        // regardless of drain timeout, since idle behavior is independent.
-        if !cli.quiet {
-            print!(
-                "  [{n_workers:>4} workers] idle-poll running ({}s)… ",
-                cli.idle_poll_duration_s
+        // Idle-poll phase — only trustworthy once the queue is verified
+        // empty. A drain trial that hit --timeout (result.timed_out) may
+        // still have real backlog sitting in the queue; starting the
+        // idle-poll phase against that backlog would let its workers race
+        // through genuine hits (no sleep on a hit — see worker.rs) and
+        // silently contaminate idle_poll_qps with leftover drain-phase
+        // throughput instead of measuring true empty-queue polling load. So
+        // this is a real LLEN check, not an assumption from `timed_out`:
+        // reaching the target completion count during the drain phase is
+        // itself a race-free "queue is empty" signal (every completion is a
+        // job actually removed, and target == the exact count pushed), but
+        // a timeout provides no such guarantee.
+        let backlog = producer::total_queue_len(&mut conn, &queue_names).await?;
+        let idle_result = if backlog > 0 {
+            let reason = format!(
+                "drain trial left {} job(s) still queued (--timeout hit with backlog \
+                 remaining) — skipping idle-poll measurement to avoid contaminating \
+                 idle_poll_qps with real job hits",
+                report::format_n(backlog)
             );
-            use std::io::Write;
-            let _ = std::io::stdout().flush();
-        }
-        let idle_result = run_idle_poll_trial(
-            &url,
-            &queue_keys,
-            n_workers,
-            poll_interval,
-            cli.idle_poll_duration_s,
-        )
-        .await?;
+            if !cli.quiet {
+                println!("  [{n_workers:>4} workers] idle-poll SKIPPED: {reason}");
+            }
+            IdlePollResult::skipped(n_workers, reason)
+        } else {
+            if !cli.quiet {
+                print!(
+                    "  [{n_workers:>4} workers] idle-poll running ({}s)… ",
+                    cli.idle_poll_duration_s
+                );
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+            }
+            run_idle_poll_trial(
+                &url,
+                &queue_keys,
+                n_workers,
+                poll_interval,
+                cli.idle_poll_duration_s,
+            )
+            .await?
+        };
         report::print_idle_poll_line(&idle_result);
 
         results.push(result);
@@ -934,5 +1068,147 @@ mod tests {
         let names = make_queue_names("default", 1);
         let keys: Vec<String> = names.iter().map(|q| format!("queue:{q}")).collect();
         assert_eq!(keys, vec!["queue:default"]);
+    }
+
+    // ── Adversarial edge cases ──────────────────────────────────────────
+
+    #[test]
+    fn parse_percentile_spec_rejects_digit_overflow() {
+        // Regression test: "p10000000000000000000" (20 digits) parses fine
+        // as a u64 (10^19 <= u64::MAX), but 10u64.pow(20) overflows u64 —
+        // panics in debug builds, silently wraps in release. Must be a clean
+        // error either way, not a crash or a bogus quantile.
+        assert!(parse_percentile_spec("p10000000000000000000").is_err());
+        // A value that overflows u64 parsing itself must also error cleanly
+        // (belt-and-braces — this path was already safe via digits.parse()).
+        assert!(parse_percentile_spec("p999999999999999999999999999999").is_err());
+        // Still-reasonable long specs must keep working.
+        assert!(parse_percentile_spec("p999999999999").is_ok()); // 12 nines
+    }
+
+    #[test]
+    fn validate_cli_rejects_zero_jobs() {
+        let mut cli = base_cli();
+        cli.jobs = 0;
+        assert!(validate_cli(&cli).is_err());
+    }
+
+    #[test]
+    fn validate_cli_rejects_zero_num_queues() {
+        let mut cli = base_cli();
+        cli.num_queues = 0;
+        assert!(validate_cli(&cli).is_err());
+    }
+
+    #[test]
+    fn validate_cli_rejects_zero_poll_interval() {
+        // The specific case this round of hardening centers on: a literal
+        // --poll-interval-ms 0 would make every empty-queue retry sleep for
+        // Duration::ZERO, i.e. spin as fast as the network allows — a
+        // self-inflicted DoS that could be mistaken for a real result rather
+        // than the busy-loop it actually is. Must be rejected outright.
+        let mut cli = base_cli();
+        cli.poll_interval_ms = 0;
+        let err = validate_cli(&cli).unwrap_err();
+        assert!(err.to_string().contains("poll-interval-ms"));
+    }
+
+    #[test]
+    fn validate_cli_rejects_zero_idle_poll_duration() {
+        let mut cli = base_cli();
+        cli.idle_poll_duration_s = 0;
+        assert!(validate_cli(&cli).is_err());
+    }
+
+    #[test]
+    fn validate_cli_rejects_zero_timeout() {
+        let mut cli = base_cli();
+        cli.timeout = 0;
+        assert!(validate_cli(&cli).is_err());
+    }
+
+    #[test]
+    fn validate_cli_rejects_empty_workers_list() {
+        let mut cli = base_cli();
+        cli.workers = vec![];
+        assert!(validate_cli(&cli).is_err());
+    }
+
+    #[test]
+    fn validate_cli_rejects_zero_in_workers_list() {
+        // A 0 anywhere in --workers (e.g. "--workers 0,10") would spin up a
+        // trial with no workers at all: it can never reach its target
+        // completion count, so it silently burns the full --timeout instead
+        // of failing fast with a clear error.
+        let mut cli = base_cli();
+        cli.workers = vec![10, 0, 50];
+        assert!(validate_cli(&cli).is_err());
+    }
+
+    #[test]
+    fn validate_cli_accepts_sane_defaults() {
+        assert!(validate_cli(&base_cli()).is_ok());
+    }
+
+    #[test]
+    fn compute_idle_poll_qps_normal_case() {
+        // 5 workers, 5000ms interval, one poll each per interval → 1 call/s
+        // fleet-wide over a 30s window = 30 calls total.
+        let (qps, per_worker) = compute_idle_poll_qps(30, 30.0, 5);
+        assert!((qps - 1.0).abs() < 1e-9, "got {qps}");
+        assert!((per_worker - 0.2).abs() < 1e-9, "got {per_worker}");
+    }
+
+    #[test]
+    fn compute_idle_poll_qps_zero_duration_is_safe() {
+        // Must not divide by zero / produce inf — the exact boundary
+        // validate_cli's --idle-poll-duration-s > 0 check exists to prevent
+        // upstream, but this pure function stays defensive independently.
+        let (qps, per_worker) = compute_idle_poll_qps(1000, 0.0, 10);
+        assert_eq!(qps, 0.0);
+        assert_eq!(per_worker, 0.0);
+    }
+
+    #[test]
+    fn compute_idle_poll_qps_non_finite_duration_is_safe() {
+        let (qps_nan, _) = compute_idle_poll_qps(100, f64::NAN, 10);
+        let (qps_neg, _) = compute_idle_poll_qps(100, -5.0, 10);
+        let (qps_inf, _) = compute_idle_poll_qps(100, f64::INFINITY, 10);
+        assert_eq!(qps_nan, 0.0);
+        assert_eq!(qps_neg, 0.0);
+        // +inf duration is technically "finite() == false" so it also falls
+        // back to the safe 0.0 branch rather than computing 100/inf == 0.0
+        // legitimately — either way the result must not be NaN/inf itself.
+        assert!(qps_inf.is_finite());
+    }
+
+    #[test]
+    fn compute_idle_poll_qps_zero_workers_is_safe() {
+        let (qps, per_worker) = compute_idle_poll_qps(500, 10.0, 0);
+        assert!((qps - 50.0).abs() < 1e-9);
+        assert_eq!(per_worker, 0.0);
+    }
+
+    #[test]
+    fn compute_idle_poll_qps_handles_very_small_interval_large_fleet() {
+        // Very aggressive config: 1ms poll interval, 5000 workers. Over a
+        // 1s window that's up to 5,000,000 calls — well within u64/f64
+        // exact-integer range, no overflow, and the fleet-wide number
+        // divided back out by worker count should round-trip sanely.
+        let (qps, per_worker) = compute_idle_poll_qps(5_000_000, 1.0, 5000);
+        assert!((qps - 5_000_000.0).abs() < 1e-6);
+        assert!((per_worker - 1000.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn compute_idle_poll_qps_huge_counter_stays_finite() {
+        // Sanity bound on "could this overflow / produce a misleading
+        // number": even at u64::MAX / 2 total calls (nowhere near a real
+        // run, but a defensive upper bound) over a normal-length window,
+        // the f64 conversion must stay finite and non-negative, not wrap or
+        // silently corrupt into a nonsense/negative figure.
+        let (qps, per_worker) = compute_idle_poll_qps(u64::MAX / 2, 30.0, 200);
+        assert!(qps.is_finite() && qps > 0.0);
+        assert!(per_worker.is_finite() && per_worker > 0.0);
     }
 }

@@ -87,6 +87,15 @@ pub struct TrialResult {
 /// an empty queue for a fixed duration. This has no Sidekiq-benchmark
 /// equivalent (BRPOP blocks; there's nothing to count) — it's the main new
 /// metric this tool exists to produce.
+///
+/// `skipped_reason` is `Some(..)` when the phase was NOT run because the
+/// queue was not verified empty going in (e.g. the preceding drain trial hit
+/// `--timeout` with backlog still queued). Running the idle-poll phase
+/// against a non-empty queue would silently contaminate `idle_poll_qps` with
+/// real job-dequeue hits (workers loop with no sleep on a hit — see
+/// `worker.rs`), making the fleet look far "busier" than true idle polling
+/// and invalidating the `workers * 1000 / poll_interval_ms` sanity check. All
+/// other fields are zeroed when skipped.
 #[derive(Debug, Clone)]
 pub struct IdlePollResult {
     pub workers: usize,
@@ -94,6 +103,22 @@ pub struct IdlePollResult {
     pub total_lpop_calls: u64,
     pub idle_poll_qps: f64,
     pub per_worker_qps: f64,
+    pub skipped_reason: Option<String>,
+}
+
+impl IdlePollResult {
+    /// Construct a result for a phase that was intentionally not run because
+    /// the queue could not be verified empty beforehand.
+    pub fn skipped(workers: usize, reason: String) -> Self {
+        Self {
+            workers,
+            duration_s: 0.0,
+            total_lpop_calls: 0,
+            idle_poll_qps: 0.0,
+            per_worker_qps: 0.0,
+            skipped_reason: Some(reason),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]

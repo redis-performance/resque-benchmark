@@ -3,6 +3,10 @@ name = "resque-bench"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "resque_bench"
+path = "src/lib.rs"
+
 [[bin]]
 name = "resque-bench"
 path = "src/main.rs"
@@ -37,6 +41,12 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # URL parsing — safe password encoding and redaction
 url = "2"
+
+[dev-dependencies]
+# Only needed to drive the redis::aio::Monitor stream in tests/ (proving the
+# real wire traffic is LPOP/RPUSH-only, no blocking variant) — not used by
+# the shipped binary.
+futures-util = "0.3"
 
 [profile.release]
 opt-level = 3

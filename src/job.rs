@@ -24,9 +24,12 @@ pub struct ResqueJob {
 
 impl ResqueJob {
     pub fn new(idx: u64) -> Self {
+        // duration_since only errs if the system clock reads before the Unix
+        // epoch (a misconfigured host clock, not attacker input) — fall back
+        // to 0 rather than panic and take down the whole producer loop.
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("clock before epoch");
+            .unwrap_or_default();
         let enqueued_at_ns = now.as_nanos() as u64;
 
         ResqueJob {
