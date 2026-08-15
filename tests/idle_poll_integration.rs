@@ -334,41 +334,40 @@ async fn only_lpop_and_rpush_observed_on_wire() {
     // A short idle-poll burst so LPOP misses are captured too.
     let _ = run_idle_workers(
         &client,
-        vec![queue_key],
+        vec![queue_key.clone()],
         3,
         Duration::from_millis(50),
         Duration::from_millis(500),
     )
     .await;
 
-    // Collect whatever MONITOR captured in a bounded window, then stop.
-    let mut lines = Vec::new();
-    let collect_deadline = Duration::from_secs(2);
-    let collected = tokio::time::timeout(collect_deadline, async {
-        while let Some(line) = messages.next().await {
-            lines.push(line);
-            if lines.len() >= 200 {
-                break;
-            }
-        }
-    })
-    .await;
-    let _ = collected; // timeout is expected — MONITOR never ends on its own
-
-    assert!(
-        !lines.is_empty(),
-        "MONITOR captured no traffic at all — test is not exercising anything"
-    );
-
-    let blocking = ["BLPOP", "BRPOP", "BLMPOP", "BLMOVE", "BRPOPLPUSH"];
+    // MONITOR is server-wide — it sees every command from every client on
+    // every db, including the OTHER integration tests running concurrently
+    // in this same binary (cargo test defaults to multiple threads). A
+    // blind "first 200 lines / 2s" cap was getting starved by that
+    // concurrent traffic before ever seeing this test's own commands. Filter
+    // to lines that reference this test's own (uniquely-named) queue key,
+    // and keep polling — with a generous overall deadline, not a line cap —
+    // until both signals are seen or time runs out.
+    let mut lines: Vec<String> = Vec::new();
     let mut saw_lpop = false;
     let mut saw_rpush = false;
-    for line in &lines {
+    let blocking = ["BLPOP", "BRPOP", "BLMPOP", "BLMOVE", "BRPOPLPUSH"];
+    let overall_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < overall_deadline && !(saw_lpop && saw_rpush) {
+        let Ok(Some(line)) =
+            tokio::time::timeout(Duration::from_millis(500), messages.next()).await
+        else {
+            continue; // per-tick timeout (no traffic this tick) — keep waiting
+        };
+        if !line.contains(&queue_key) {
+            continue; // some other concurrently-running test's traffic
+        }
         let upper = line.to_uppercase();
         for b in blocking {
             assert!(
                 !upper.contains(b),
-                "observed a blocking command on the wire: {line}"
+                "observed a blocking command against our own queue on the wire: {line}"
             );
         }
         if upper.contains("\"LPOP\"") {
@@ -377,14 +376,16 @@ async fn only_lpop_and_rpush_observed_on_wire() {
         if upper.contains("\"RPUSH\"") {
             saw_rpush = true;
         }
+        lines.push(line);
     }
+
     assert!(
         saw_lpop,
-        "expected at least one LPOP in captured MONITOR traffic: {lines:?}"
+        "expected at least one LPOP against {queue_key} in MONITOR traffic; captured: {lines:?}"
     );
     assert!(
         saw_rpush,
-        "expected at least one RPUSH in captured MONITOR traffic: {lines:?}"
+        "expected at least one RPUSH against {queue_key} in MONITOR traffic; captured: {lines:?}"
     );
 
     producer::clear_queue(&mut conn, &[queue]).await.unwrap();
