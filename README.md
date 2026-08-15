@@ -218,10 +218,23 @@ REDIS_IMAGE=redis:7.4 docker compose run --rm bench
 REDIS_URL=redis://myhost:6379/0 docker compose run --rm bench
 ```
 
-### Pre-built binary
+### Install from GitHub Release
+
+Pre-built static binaries for `x86_64` and `aarch64` Linux are attached to every
+[release](https://github.com/redis-performance/resque-benchmark/releases), each with
+a `.sha256` checksum alongside it:
 
 ```bash
-resque-bench --workers 10,50,100,200 --jobs 500000
+# Pick one target: linux-x86_64-gnu or linux-aarch64-gnu
+TARGET=linux-x86_64-gnu
+VERSION=v0.1.0
+
+curl -sLO https://github.com/redis-performance/resque-benchmark/releases/download/$VERSION/resque-bench-$VERSION-$TARGET.tar.gz
+curl -sLO https://github.com/redis-performance/resque-benchmark/releases/download/$VERSION/resque-bench-$VERSION-$TARGET.tar.gz.sha256
+sha256sum -c resque-bench-$VERSION-$TARGET.tar.gz.sha256
+
+tar xzf resque-bench-$VERSION-$TARGET.tar.gz
+./resque-bench-$VERSION-$TARGET/resque-bench --help
 ```
 
 ### From source
