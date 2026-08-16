@@ -178,6 +178,13 @@ a hidden approximation of the default one.
 
 ### Docker Hub
 
+Multi-platform image (`linux/amd64`, `linux/arm64`) published to
+[`redis/resque-benchmark`](https://hub.docker.com/r/redis/resque-benchmark):
+
+```bash
+docker pull redis/resque-benchmark:latest
+```
+
 > **Memory:** the default run pre-fills 500,000 jobs (~250 B each) → **~120
 > MB** peak Redis memory before workers drain the queue. Use `--jobs 50000`
 > (~12 MB) for a quick local smoke test.
