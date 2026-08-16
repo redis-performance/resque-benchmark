@@ -411,6 +411,15 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
+`cargo test` includes real-Redis integration tests
+(`tests/idle_poll_integration.rs`) that enqueue real jobs, drain them with
+real workers, and assert `idle_poll_qps` lands within tolerance of
+`workers * 1000 / poll_interval_ms` — the same sanity check documented
+above, checked automatically rather than eyeballed. They target
+`REDIS_URL` (default `redis://127.0.0.1:6379/15`) and skip gracefully
+with a `SKIP:` notice if nothing is reachable there, so plain `cargo test`
+still works without a local Redis running.
+
 ## Docker image
 
 Multi-platform image (`linux/amd64`, `linux/arm64`) published to

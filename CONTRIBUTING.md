@@ -65,6 +65,15 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
+`cargo test` includes real-Redis integration tests under `tests/`
+(`REDIS_URL`, default `redis://127.0.0.1:6379/15`) — they enqueue real
+jobs, drive real workers, and assert `idle_poll_qps` against the
+`workers * 1000 / poll_interval_ms` sanity check as an automated
+regression, plus a MONITOR-based check that only LPOP/RPUSH ever hit the
+wire. They skip with a `SKIP:` notice (not a failure) if nothing is
+reachable at `REDIS_URL`, so `cargo test` still works without Redis
+running locally — but CI always has one, so these run for real there.
+
 For a full end-to-end smoke test (requires a running Redis on `127.0.0.1:6379`):
 
 ```bash
