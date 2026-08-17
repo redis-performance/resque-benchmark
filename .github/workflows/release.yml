@@ -19,13 +19,13 @@ jobs:
           # runners are available for public repos, so this needs neither
           # `cross` nor QEMU cross-compilation (the Docker workflow already
           # proves QEMU works here if a target ever needs it instead).
-          - target: x86_64-unknown-linux-gnu
+          - target: x86_64-unknown-linux-musl
             os: ubuntu-24.04
-            artifact_name: linux-x86_64-gnu
+            artifact_name: linux-x86_64-musl
             expect_arch: x86-64
-          - target: aarch64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-musl
             os: ubuntu-24.04-arm
-            artifact_name: linux-aarch64-gnu
+            artifact_name: linux-aarch64-musl
             expect_arch: ARM aarch64
 
     steps:
@@ -38,6 +38,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+
+      # rustls pulls in `ring`, which compiles C and assembly, so the musl target needs a musl
+      # C toolchain even though the rest of the tree is pure Rust.
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
@@ -61,6 +66,22 @@ jobs:
           # aarch64 hosted runner, so this is a real execution, not a
           # cross-arch no-op).
           "$BIN" --version
+
+      # Running the binary on the BUILD host (the step above) proves it executes there, which is
+      # exactly what it cannot tell us: the previous -gnu releases ran fine on ubuntu-24.04 and
+      # still required GLIBC_2.39, so they could not start on Ubuntu 22.04 (2.35), Debian 12 (2.36)
+      # or RHEL 9 (2.34). Assert the floor is gone rather than inferring it from a passing smoke.
+      - name: Assert no glibc dependency
+        run: |
+          set -euo pipefail
+          BIN="target/${{ matrix.target }}/release/resque-bench"
+          if objdump -T "$BIN" 2>/dev/null | grep -qE 'GLIBC_[0-9]+\.[0-9]+'; then
+            MAX=$(objdump -T "$BIN" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -uV | tail -1)
+            echo "::error::artifact still links against glibc (max $MAX); it will not run on older hosts"
+            exit 1
+          fi
+          file "$BIN"
+          echo "OK: statically linked, no glibc version floor"
 
       - name: Package tarball
         run: |
