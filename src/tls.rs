@@ -41,5 +41,10 @@ mod tests {
         install_crypto_provider();
         install_crypto_provider();
         install_crypto_provider();
+
+        assert!(
+            rustls::crypto::CryptoProvider::get_default().is_some(),
+            "a process-wide CryptoProvider must be installed after calling install_crypto_provider()"
+        );
     }
 }

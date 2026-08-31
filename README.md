@@ -285,7 +285,10 @@ knows about), that's all you need.
 Against a server using a self-signed or private-CA certificate — the normal
 case for test/staging/ephemeral benchmark deployments — the TLS handshake
 will fail with a certificate verification error. Pass `--insecure` (or set
-`REDIS_TLS_INSECURE=1`) to skip server certificate verification. Internally
+`REDIS_TLS_INSECURE=true`) to skip server certificate verification — the
+env var only accepts the literal strings `true`/`false` (same as `--tls`'s
+`REDIS_TLS`); `REDIS_TLS_INSECURE=1` is a parse error, not a silent enable.
+Internally
 this appends redis-rs's documented `#insecure` fragment to the connection URL
 (e.g. `rediss://host:6379/0#insecure`); the crate's `tls-rustls-insecure`
 feature (enabled in `Cargo.toml`) is what makes that fragment actually take

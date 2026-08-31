@@ -117,12 +117,26 @@ jobs:
             --pidfile /tmp/tls/redis.pid \
             --logfile /tmp/tls/redis.log \
             --dir /tmp/tls
+          # Real readiness probe: wait until the TLS listener actually completes a
+          # handshake and answers PING, instead of just checking the pidfile showed up
+          # (which only proves the process forked, not that the TLS port is accepting
+          # connections yet). Without this, both assertions below could trivially pass
+          # against a server that isn't listening yet — non-zero exit and "no panic in
+          # stderr" are equally true for connection-refused as for an actual cert
+          # rejection.
+          ready=0
           for i in $(seq 1 10); do
-            [ -f /tmp/tls/redis.pid ] && break
+            if redis-cli -p 16391 --tls --insecure --cacert /tmp/tls/cert.pem ping 2>/dev/null | grep -q PONG; then
+              ready=1
+              break
+            fi
             sleep 0.5
           done
-          sleep 1
           cat /tmp/tls/redis.log
+          if [ "$ready" -ne 1 ]; then
+            echo "::error::TLS redis-server never became ready to accept a handshake — see /tmp/tls/redis.log"
+            exit 1
+          fi
 
           echo "=== without --insecure: must fail cleanly on the untrusted cert, not panic ==="
           set +e
@@ -142,6 +156,10 @@ jobs:
             echo "::error::binary panicked instead of failing cleanly with a certificate error — see /tmp/tls_verify.err"
             exit 1
           fi
+          grep -q "invalid peer certificate" /tmp/tls_verify.err || {
+            echo "::error::expected a certificate-verification error (\"invalid peer certificate\") on stderr — a connection-refused or other unrelated failure would also satisfy the non-zero-exit-and-no-panic checks above, see /tmp/tls_verify.err"
+            exit 1
+          }
 
           echo "=== with --insecure: must complete a real run over the TLS connection ==="
           ./target/release/resque-bench \

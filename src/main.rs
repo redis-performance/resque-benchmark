@@ -189,7 +189,7 @@ fn build_redis_url(cli: &Cli) -> Result<String> {
 fn url_disables_cert_verification(url: &str) -> bool {
     url::Url::parse(url)
         .ok()
-        .and_then(|u| u.fragment().map(|f| f == "insecure"))
+        .map(|u| u.scheme() == "rediss" && u.fragment() == Some("insecure"))
         .unwrap_or(false)
 }
 
@@ -1185,6 +1185,18 @@ mod tests {
     #[test]
     fn url_disables_cert_verification_false_for_unparsable_url() {
         assert!(!url_disables_cert_verification("not a url"));
+    }
+
+    #[test]
+    fn url_disables_cert_verification_false_for_plain_scheme_with_stray_fragment() {
+        // A plain (non-TLS) connection with a `#insecure` fragment tacked on is not a
+        // TLS-verification issue at all — the real problem there is that the
+        // connection is plaintext, not that TLS verification is skipped. Must not
+        // print the "TLS certificate verification is DISABLED" warning, which would
+        // be misleading (there's no TLS in play to disable verification on).
+        assert!(!url_disables_cert_verification(
+            "redis://host:6379/0#insecure"
+        ));
     }
 
     // Serializes the env-var tests below: they all mutate the SAME process-wide
