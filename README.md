@@ -294,6 +294,18 @@ effect, rather than being silently parsed and ignored.
 **Warning:** `--insecure` disables verification of the server's identity —
 only use it against endpoints you trust, never over an untrusted network.
 
+**Behavior change / blast radius:** the `tls-rustls-insecure` Cargo feature
+is a build-time, crate-wide switch — it is not gated behind `--insecure` at
+runtime. Before this feature was enabled, a `--url` already carrying a
+`#insecure` fragment (e.g. `rediss://host:6379/0#insecure`) was silently
+*ignored* and the connection got full certificate verification regardless.
+Now that the feature is compiled in, that same pre-existing `#insecure`
+fragment takes effect automatically — certificate verification is skipped
+even if you never pass `--insecure` yourself. This is intentional (it's the
+whole point of the fix — see #7), but is worth calling out explicitly since
+it changes the security posture of any existing `--url`/`REDIS_URL` value
+that happened to carry that fragment.
+
 ### Multi-queue mode
 
 Resque workers check configured queues in a fixed priority order every poll

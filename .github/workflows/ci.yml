@@ -39,6 +39,18 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      - name: Guard tls-rustls-insecure feature stays enabled
+        # --insecure (REDIS_TLS_INSECURE) silently becomes a no-op if this
+        # Cargo feature is ever dropped from the `redis` dependency (e.g. a
+        # future dependency edit) — the URL's `#insecure` fragment still
+        # parses fine either way, so all existing tests would stay green.
+        # Fail CI loudly instead of letting that regress silently.
+        run: |
+          cargo tree -e features -i redis --workspace | grep -q tls-rustls-insecure || {
+            echo "::error::tls-rustls-insecure feature is no longer enabled on the redis crate — --insecure/REDIS_TLS_INSECURE would silently become a no-op"
+            exit 1
+          }
+
       - name: Unit + integration tests
         # tests/idle_poll_integration.rs drives real PollWorker/producer code
         # against the `redis` service above (db 15, distinct from the smoke

@@ -959,6 +959,7 @@ impl<'a> Clone for TrialConfig<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use redis::IntoConnectionInfo;
 
     fn base_cli() -> Cli {
         Cli {
@@ -1051,6 +1052,30 @@ mod tests {
             url.ends_with("#insecure"),
             "expected #insecure fragment, got {url}"
         );
+
+        // Don't just assert on the string — parse it through redis-rs's own
+        // parser (the same `IntoConnectionInfo` path `redis::Client::open`
+        // uses internally) and assert on the resulting ConnectionAddr. This
+        // catches upstream changes to the fragment name/format that a
+        // string-only assertion would miss (e.g. if redis-rs ever renamed
+        // `#insecure` or changed how it's parsed). It does NOT catch the
+        // `tls-rustls-insecure` Cargo feature itself being dropped — that
+        // gate only affects whether the TLS connector *honors* `insecure`
+        // at connect time, not how the URL is parsed into ConnectionAddr;
+        // see the `cargo tree` CI guard for that separate regression class.
+        let info = url
+            .as_str()
+            .into_connection_info()
+            .expect("redis-rs should parse our own generated URL");
+        match info.addr() {
+            redis::ConnectionAddr::TcpTls { insecure, .. } => {
+                assert!(
+                    *insecure,
+                    "redis-rs parsed the URL but did not set insecure=true"
+                );
+            }
+            other => panic!("expected ConnectionAddr::TcpTls, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1073,6 +1098,76 @@ mod tests {
             build_redis_url(&cli).is_err(),
             "--insecure without --tls (or a rediss:// URL) should be an error, not a silent no-op"
         );
+    }
+
+    // Serializes the env-var tests below: they all mutate the SAME process-wide
+    // env vars (REDIS_TLS_INSECURE / REDIS_TLS), which `cargo test`'s default
+    // multi-threaded runner would otherwise let race against each other.
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Set an env var for the duration of `f`, always removing it afterward
+    /// (even on panic, so one failing assertion can't poison later tests).
+    fn with_env_var<R>(key: &str, value: &str, f: impl FnOnce() -> R) -> R {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var(key, value);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        std::env::remove_var(key);
+        match result {
+            Ok(r) => r,
+            Err(e) => std::panic::resume_unwind(e),
+        }
+    }
+
+    #[test]
+    fn insecure_env_var_false_resolves_to_false_not_presence_flag() {
+        // REDIS_TLS_INSECURE=false must resolve to `insecure: false` — i.e. clap
+        // actually parses the env value as a bool rather than treating "the
+        // variable is merely present" as true. This repo has the identical
+        // env-backed-bool pattern on --tls/REDIS_TLS; verify it here too.
+        with_env_var("REDIS_TLS_INSECURE", "false", || {
+            let cli = Cli::try_parse_from(["resque-bench"])
+                .expect("REDIS_TLS_INSECURE=false should parse");
+            assert!(
+                !cli.insecure,
+                "REDIS_TLS_INSECURE=false must resolve to false, not true"
+            );
+        });
+    }
+
+    #[test]
+    fn insecure_env_var_true_resolves_to_true() {
+        with_env_var("REDIS_TLS_INSECURE", "true", || {
+            let cli = Cli::try_parse_from(["resque-bench"])
+                .expect("REDIS_TLS_INSECURE=true should parse");
+            assert!(cli.insecure);
+        });
+    }
+
+    #[test]
+    fn insecure_env_var_zero_is_a_clean_parse_error_not_silent_true() {
+        // clap's derived bool+env parsing only recognizes the literals "true"
+        // and "false" (verified against clap 4.6.6, the version pinned in
+        // Cargo.lock) — "0" is neither, so this must be a clean parse error,
+        // never silently coerced to `true` via "the variable is set at all".
+        // A silent-true here would be the actual security-relevant regression
+        // this test guards against: --insecure flipping on TLS verification
+        // skip because a script exported REDIS_TLS_INSECURE=0 meaning "off".
+        with_env_var("REDIS_TLS_INSECURE", "0", || {
+            assert!(
+                Cli::try_parse_from(["resque-bench"]).is_err(),
+                "REDIS_TLS_INSECURE=0 should be a parse error, not silently true"
+            );
+        });
+    }
+
+    #[test]
+    fn tls_env_var_false_resolves_to_false_not_presence_flag() {
+        // Same pattern, on the pre-existing --tls/REDIS_TLS flag this one is
+        // modeled on — confirms the existing behavior this PR relies on.
+        with_env_var("REDIS_TLS", "false", || {
+            let cli = Cli::try_parse_from(["resque-bench"]).expect("REDIS_TLS=false should parse");
+            assert!(!cli.tls, "REDIS_TLS=false must resolve to false, not true");
+        });
     }
 
     #[test]
