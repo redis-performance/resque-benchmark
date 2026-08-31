@@ -736,6 +736,13 @@ fn validate_cli(cli: &Cli) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // redis-rs's rustls integration enables no crypto backend of its own (see the
+    // `rustls` dependency comment in Cargo.toml) — rustls 0.23 requires the process to
+    // install one exactly once before any TLS connection is attempted, or it panics.
+    // `install_default()` returns Err if a provider is already installed (e.g. called
+    // twice in one process); that's fine here, so the result is ignored.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let cli = Cli::parse();
     validate_cli(&cli)?;
 
