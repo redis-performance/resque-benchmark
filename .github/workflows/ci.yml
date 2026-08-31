@@ -39,6 +39,18 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      - name: Guard tls-rustls-insecure feature stays enabled
+        # --insecure (REDIS_TLS_INSECURE) silently becomes a no-op if this
+        # Cargo feature is ever dropped from the `redis` dependency (e.g. a
+        # future dependency edit) — the URL's `#insecure` fragment still
+        # parses fine either way, so all existing tests would stay green.
+        # Fail CI loudly instead of letting that regress silently.
+        run: |
+          cargo tree -e features -i redis --workspace | grep -q tls-rustls-insecure || {
+            echo "::error::tls-rustls-insecure feature is no longer enabled on the redis crate — --insecure/REDIS_TLS_INSECURE would silently become a no-op"
+            exit 1
+          }
+
       - name: Unit + integration tests
         # tests/idle_poll_integration.rs drives real PollWorker/producer code
         # against the `redis` service above (db 15, distinct from the smoke
@@ -73,3 +85,97 @@ jobs:
             .results[0].idle_poll.total_lpop_calls > 0 and
             .results[0].idle_poll.idle_poll_qps > 0
           ' /tmp/smoke.json
+
+      - name: Real TLS handshake smoke test (self-signed cert)
+        # The redis:8.6 `services` container above only exposes a plaintext port — it
+        # proves nothing about --tls/--insecure, which is what actually broke end-to-end
+        # (see the CryptoProvider panic fixed in this PR). This step stands up a
+        # dedicated TLS-only redis-server with a throwaway self-signed cert and drives
+        # the real built binary against it both ways:
+        #   - without --insecure: must fail cleanly with a certificate error (the
+        #     self-signed cert isn't trusted), and MUST NOT panic — a naive fix could
+        #     leave the CryptoProvider-missing panic in place for the verifying path.
+        #   - with --insecure: must complete a full run over the TLS connection, and
+        #     must print the insecure-mode warning on stderr.
+        run: |
+          set -euo pipefail
+
+          command -v redis-server >/dev/null || { sudo apt-get update && sudo apt-get install -y redis-server; }
+          command -v openssl >/dev/null || { sudo apt-get update && sudo apt-get install -y openssl; }
+
+          mkdir -p /tmp/tls
+          openssl req -x509 -newkey rsa:2048 -nodes -keyout /tmp/tls/key.pem -out /tmp/tls/cert.pem -days 1 -subj /CN=localhost
+
+          redis-server \
+            --port 0 \
+            --tls-port 16391 \
+            --tls-cert-file /tmp/tls/cert.pem \
+            --tls-key-file /tmp/tls/key.pem \
+            --tls-ca-cert-file /tmp/tls/cert.pem \
+            --tls-cluster no --tls-replication no --tls-auth-clients no \
+            --daemonize yes \
+            --pidfile /tmp/tls/redis.pid \
+            --logfile /tmp/tls/redis.log \
+            --dir /tmp/tls
+          # Real readiness probe: wait until the TLS listener actually completes a
+          # handshake and answers PING, instead of just checking the pidfile showed up
+          # (which only proves the process forked, not that the TLS port is accepting
+          # connections yet). Without this, both assertions below could trivially pass
+          # against a server that isn't listening yet — non-zero exit and "no panic in
+          # stderr" are equally true for connection-refused as for an actual cert
+          # rejection.
+          ready=0
+          for i in $(seq 1 10); do
+            if redis-cli -p 16391 --tls --insecure --cacert /tmp/tls/cert.pem ping 2>/dev/null | grep -q PONG; then
+              ready=1
+              break
+            fi
+            sleep 0.5
+          done
+          cat /tmp/tls/redis.log
+          if [ "$ready" -ne 1 ]; then
+            echo "::error::TLS redis-server never became ready to accept a handshake — see /tmp/tls/redis.log"
+            exit 1
+          fi
+
+          echo "=== without --insecure: must fail cleanly on the untrusted cert, not panic ==="
+          set +e
+          ./target/release/resque-bench \
+            --url rediss://127.0.0.1:16391/0 \
+            --workers 1 --jobs 5 --poll-interval-ms 100 --idle-poll-duration-s 1 --timeout 5 \
+            --quiet --tag ci-tls --output - \
+            >/tmp/tls_verify.out 2>/tmp/tls_verify.err
+          status=$?
+          set -e
+          cat /tmp/tls_verify.err
+          if [ "$status" -eq 0 ]; then
+            echo "::error::expected a non-zero exit connecting without --insecure against a self-signed cert, got success"
+            exit 1
+          fi
+          if grep -qi "panic" /tmp/tls_verify.err; then
+            echo "::error::binary panicked instead of failing cleanly with a certificate error — see /tmp/tls_verify.err"
+            exit 1
+          fi
+          grep -q "invalid peer certificate" /tmp/tls_verify.err || {
+            echo "::error::expected a certificate-verification error (\"invalid peer certificate\") on stderr — a connection-refused or other unrelated failure would also satisfy the non-zero-exit-and-no-panic checks above, see /tmp/tls_verify.err"
+            exit 1
+          }
+
+          echo "=== with --insecure: must complete a real run over the TLS connection ==="
+          ./target/release/resque-bench \
+            --url rediss://127.0.0.1:16391/0 --insecure \
+            --workers 2 --jobs 200 --poll-interval-ms 100 --idle-poll-duration-s 1 --timeout 10 \
+            --quiet --tag ci-tls --output /tmp/tls_insecure.json \
+            2>/tmp/tls_insecure.err
+          cat /tmp/tls_insecure.err
+          grep -q "TLS certificate verification is DISABLED" /tmp/tls_insecure.err || {
+            echo "::error::expected the insecure-mode warning on stderr when --insecure is passed"
+            exit 1
+          }
+          jq -e '
+            .results[0].total_jobs == 200 and
+            .results[0].timed_out == false and
+            .results[0].errors == 0
+          ' /tmp/tls_insecure.json
+
+          redis-cli -p 16391 --tls --insecure --cacert /tmp/tls/cert.pem shutdown nosave || true

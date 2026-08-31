@@ -15,7 +15,27 @@ path = "src/main.rs"
 # Redis client — plain RPUSH/LPOP, no blocking commands (matches Resque's real wire
 # protocol; see README "Protocol compatibility" for exact source citations).
 # tls-rustls-webpki-roots bundles Mozilla root CAs so TLS works without OS ca-certificates.
-redis = { version = "1", features = ["tokio-comp", "tokio-rustls-comp", "tls-rustls-webpki-roots"] }
+# tls-rustls-insecure enables the `rediss://host:port/#insecure` URL escape hatch
+# (used by --insecure) to skip certificate verification for self-signed/private-CA
+# certs — without this feature, redis-rs hard-fails the connection attempt outright
+# (ErrorKind::InvalidClientConfig, "Cannot create insecure client without
+# tls-rustls-insecure feature"; see redis-1.5.0/src/connection.rs:1274-1279) rather than
+# silently ignoring the #insecure fragment and falling back to full certificate verification.
+redis = { version = "1", features = ["tokio-comp", "tokio-rustls-comp", "tls-rustls-webpki-roots", "tls-rustls-insecure"] }
+
+# redis-rs's rustls integration deliberately does NOT pick a crypto backend for you
+# (its own `rustls` dependency is default-features = false — only `rustls/std` is enabled,
+# see redis-1.5.0/Cargo.toml:493-496) so it never enables rustls's "ring" or "aws-lc-rs"
+# feature anywhere in the dependency graph. rustls 0.23 requires the *application* to
+# install a process-wide CryptoProvider once (rustls::crypto::CryptoProvider::install_default)
+# before any TLS connection is attempted, or every TLS connection panics ("Could not
+# automatically determine the process-level CryptoProvider..."). This crate exists purely so
+# Cargo enables rustls's "ring" feature for the single resolved rustls package; the actual
+# install_default() call lives in src/tls.rs::install_crypto_provider(), a reusable,
+# idempotent helper called from both main() at startup and any test that opens a real
+# rediss:// connection. Matches redis-rs's own dev-dependencies, which use the same "ring"
+# feature for their tests (redis-1.5.0/Cargo.toml:604-606).
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

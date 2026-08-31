@@ -41,6 +41,17 @@ struct Cli {
     #[arg(long, env = "REDIS_TLS")]
     tls: bool,
 
+    /// Skip TLS server certificate verification (only meaningful with --tls, or
+    /// a rediss:// --url). Required to connect to servers using self-signed or
+    /// private-CA certs — the normal case for test/staging/ephemeral benchmark
+    /// deployments. Implemented via redis-rs's documented
+    /// `rediss://host:port/#insecure` URL escape hatch (see Cargo.toml — this
+    /// requires the `tls-rustls-insecure` feature to actually take effect).
+    /// WARNING: disables verification of the server's identity — only use this
+    /// against endpoints you trust, never over an untrusted network.
+    #[arg(long, env = "REDIS_TLS_INSECURE")]
+    insecure: bool,
+
     /// Redis database number. When omitted, the db in --url is used, falling back to 13
     /// (the Ruby sidekiqload safety default). Note db > 0 does not exist on Redis Cluster
     /// or most managed Redis, so `--db 0` is usually required against those.
@@ -133,6 +144,18 @@ fn build_redis_url(cli: &Cli) -> Result<String> {
         u.set_scheme("rediss")
             .map_err(|_| anyhow::anyhow!("cannot upgrade scheme to rediss"))?;
     }
+    if cli.insecure {
+        anyhow::ensure!(
+            u.scheme() == "rediss",
+            "--insecure requires TLS: pass --tls (or use a rediss:// --url)"
+        );
+        // redis-rs's documented escape hatch: a `#insecure` fragment on a
+        // rediss:// URL disables server certificate verification, but only
+        // does anything when the crate is built with the tls-rustls-insecure
+        // feature (see Cargo.toml) — otherwise it is silently parsed and
+        // ignored, which was the root cause of this flag not existing before.
+        u.set_fragment(Some("insecure"));
+    }
     if let Some(password) = &cli.password {
         // url::Url::set_password percent-encodes special characters (e.g. '@', '/', ':').
         // NOTE: the error path below must never echo `password` — only the (already
@@ -152,6 +175,22 @@ fn build_redis_url(cli: &Cli) -> Result<String> {
     }
 
     Ok(u.to_string())
+}
+
+/// True when `url`'s fragment is exactly `insecure` — i.e. redis-rs will actually skip
+/// TLS certificate verification for it (the `rediss://host:port/#insecure` escape
+/// hatch it documents — see the `--insecure` flag's help text). This is checked
+/// against the FINAL built URL rather than `cli.insecure` because a user-supplied
+/// `--url`/`REDIS_URL` can already carry that fragment on its own, disabling
+/// verification without `--insecure` ever being passed — that path deserves the same
+/// warning `--insecure` gets, not silence. A URL that fails to parse is treated as
+/// not-insecure (`build_redis_url` already fails fast on an unparsable URL before this
+/// would ever be called with one).
+fn url_disables_cert_verification(url: &str) -> bool {
+    url::Url::parse(url)
+        .ok()
+        .map(|u| u.scheme() == "rediss" && u.fragment() == Some("insecure"))
+        .unwrap_or(false)
 }
 
 /// Return the URL with the password replaced by **** for logging and JSON output.
@@ -713,11 +752,30 @@ fn validate_cli(cli: &Cli) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // See src/tls.rs doc comment: redis-rs's rustls integration installs no crypto
+    // backend of its own, so rustls 0.23 panics on ANY TLS connection (not just
+    // --insecure ones) unless the process installs one first.
+    resque_bench::tls::install_crypto_provider();
+
     let cli = Cli::parse();
     validate_cli(&cli)?;
 
     let url = build_redis_url(&cli)?;
     let display_url = redact_url(&url);
+
+    // Warn whenever the FINAL built URL will actually skip certificate verification —
+    // keyed off the URL's own `#insecure` fragment, not `cli.insecure` — so a
+    // user-supplied `--url`/`REDIS_URL` that already carries `#insecure` (redis-rs's
+    // own documented `rediss://host:port/#insecure` escape hatch) gets the same loud
+    // warning as passing `--insecure` explicitly, instead of silently disabling
+    // verification with no indication in the output.
+    if url_disables_cert_verification(&url) {
+        eprintln!(
+            "warning: TLS certificate verification is DISABLED for this connection \
+             (insecure mode) — the server's certificate chain and hostname are not \
+             validated. Only use this against trusted networks."
+        );
+    }
 
     // Warn loudly if FLUSHDB is enabled on db 0 — application data lives there by default.
     if cli.allow_flushdb {
@@ -936,6 +994,7 @@ impl<'a> Clone for TrialConfig<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use redis::IntoConnectionInfo;
 
     fn base_cli() -> Cli {
         Cli {
@@ -944,6 +1003,7 @@ mod tests {
             port: None,
             password: None,
             tls: false,
+            insecure: false,
             db: Some(0),
             workers: vec![10],
             jobs: 1000,
@@ -1014,6 +1074,199 @@ mod tests {
         cli.tls = true;
         let url = build_redis_url(&cli).unwrap();
         assert!(url.starts_with("rediss://"), "expected rediss:// got {url}");
+    }
+
+    #[test]
+    fn build_redis_url_insecure_appends_fragment_with_tls() {
+        let mut cli = base_cli();
+        cli.tls = true;
+        cli.insecure = true;
+        let url = build_redis_url(&cli).unwrap();
+        assert!(url.starts_with("rediss://"), "expected rediss:// got {url}");
+        assert!(
+            url.ends_with("#insecure"),
+            "expected #insecure fragment, got {url}"
+        );
+
+        // Don't just assert on the string — parse it through redis-rs's own
+        // parser (the same `IntoConnectionInfo` path `redis::Client::open`
+        // uses internally) and assert on the resulting ConnectionAddr. This
+        // catches upstream changes to the fragment name/format that a
+        // string-only assertion would miss (e.g. if redis-rs ever renamed
+        // `#insecure` or changed how it's parsed). It does NOT catch the
+        // `tls-rustls-insecure` Cargo feature itself being dropped — that
+        // gate only affects whether the TLS connector *honors* `insecure`
+        // at connect time, not how the URL is parsed into ConnectionAddr;
+        // see the `cargo tree` CI guard for that separate regression class.
+        let info = url
+            .as_str()
+            .into_connection_info()
+            .expect("redis-rs should parse our own generated URL");
+        match info.addr() {
+            redis::ConnectionAddr::TcpTls { insecure, .. } => {
+                assert!(
+                    *insecure,
+                    "redis-rs parsed the URL but did not set insecure=true"
+                );
+            }
+            other => panic!("expected ConnectionAddr::TcpTls, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_redis_url_insecure_works_with_rediss_url_without_tls_flag() {
+        let mut cli = base_cli();
+        cli.url = "rediss://127.0.0.1:6379/0".into();
+        cli.insecure = true;
+        let url = build_redis_url(&cli).unwrap();
+        assert!(
+            url.ends_with("#insecure"),
+            "expected #insecure fragment, got {url}"
+        );
+    }
+
+    #[test]
+    fn build_redis_url_insecure_without_tls_is_rejected() {
+        let mut cli = base_cli();
+        cli.insecure = true;
+        assert!(
+            build_redis_url(&cli).is_err(),
+            "--insecure without --tls (or a rediss:// URL) should be an error, not a silent no-op"
+        );
+    }
+
+    // ── url_disables_cert_verification — the insecure-mode warning gate ────────
+    //
+    // Keyed off the FINAL URL's own `#insecure` fragment, not `cli.insecure`, so a
+    // user-supplied --url/REDIS_URL that already carries `#insecure` (redis-rs's own
+    // documented escape hatch) gets warned about too — not just the --insecure flag
+    // path. This is the gap the warning used to have: main() previously keyed the
+    // warning off `cli.insecure` directly, so `--url rediss://host:6380/0#insecure`
+    // (or the REDIS_URL env var carrying that fragment) silently disabled certificate
+    // verification with zero indication in the output.
+
+    #[test]
+    fn url_disables_cert_verification_false_by_default() {
+        // Default case: no fragment at all — must not trigger the warning.
+        let cli = base_cli();
+        let url = build_redis_url(&cli).unwrap();
+        assert!(!url_disables_cert_verification(&url), "url={url}");
+    }
+
+    #[test]
+    fn url_disables_cert_verification_true_via_insecure_flag() {
+        let mut cli = base_cli();
+        cli.tls = true;
+        cli.insecure = true;
+        let url = build_redis_url(&cli).unwrap();
+        assert!(url_disables_cert_verification(&url), "url={url}");
+    }
+
+    #[test]
+    fn url_disables_cert_verification_true_via_url_supplied_fragment_without_flag() {
+        // The gap this fixes: --insecure was never passed, but --url itself already
+        // carries #insecure. Must still warn.
+        let mut cli = base_cli();
+        cli.url = "rediss://127.0.0.1:6379/0#insecure".into();
+        cli.db = None;
+        assert!(!cli.insecure, "test fixture must not set --insecure");
+        let url = build_redis_url(&cli).unwrap();
+        assert!(url_disables_cert_verification(&url), "url={url}");
+    }
+
+    #[test]
+    fn url_disables_cert_verification_false_for_plain_tls_without_insecure() {
+        let mut cli = base_cli();
+        cli.tls = true;
+        let url = build_redis_url(&cli).unwrap();
+        assert!(!url_disables_cert_verification(&url), "url={url}");
+    }
+
+    #[test]
+    fn url_disables_cert_verification_false_for_unparsable_url() {
+        assert!(!url_disables_cert_verification("not a url"));
+    }
+
+    #[test]
+    fn url_disables_cert_verification_false_for_plain_scheme_with_stray_fragment() {
+        // A plain (non-TLS) connection with a `#insecure` fragment tacked on is not a
+        // TLS-verification issue at all — the real problem there is that the
+        // connection is plaintext, not that TLS verification is skipped. Must not
+        // print the "TLS certificate verification is DISABLED" warning, which would
+        // be misleading (there's no TLS in play to disable verification on).
+        assert!(!url_disables_cert_verification(
+            "redis://host:6379/0#insecure"
+        ));
+    }
+
+    // Serializes the env-var tests below: they all mutate the SAME process-wide
+    // env vars (REDIS_TLS_INSECURE / REDIS_TLS), which `cargo test`'s default
+    // multi-threaded runner would otherwise let race against each other.
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Set an env var for the duration of `f`, always removing it afterward
+    /// (even on panic, so one failing assertion can't poison later tests).
+    fn with_env_var<R>(key: &str, value: &str, f: impl FnOnce() -> R) -> R {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var(key, value);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        std::env::remove_var(key);
+        match result {
+            Ok(r) => r,
+            Err(e) => std::panic::resume_unwind(e),
+        }
+    }
+
+    #[test]
+    fn insecure_env_var_false_resolves_to_false_not_presence_flag() {
+        // REDIS_TLS_INSECURE=false must resolve to `insecure: false` — i.e. clap
+        // actually parses the env value as a bool rather than treating "the
+        // variable is merely present" as true. This repo has the identical
+        // env-backed-bool pattern on --tls/REDIS_TLS; verify it here too.
+        with_env_var("REDIS_TLS_INSECURE", "false", || {
+            let cli = Cli::try_parse_from(["resque-bench"])
+                .expect("REDIS_TLS_INSECURE=false should parse");
+            assert!(
+                !cli.insecure,
+                "REDIS_TLS_INSECURE=false must resolve to false, not true"
+            );
+        });
+    }
+
+    #[test]
+    fn insecure_env_var_true_resolves_to_true() {
+        with_env_var("REDIS_TLS_INSECURE", "true", || {
+            let cli = Cli::try_parse_from(["resque-bench"])
+                .expect("REDIS_TLS_INSECURE=true should parse");
+            assert!(cli.insecure);
+        });
+    }
+
+    #[test]
+    fn insecure_env_var_zero_is_a_clean_parse_error_not_silent_true() {
+        // clap's derived bool+env parsing only recognizes the literals "true"
+        // and "false" (verified against clap 4.6.6, the version pinned in
+        // Cargo.lock) — "0" is neither, so this must be a clean parse error,
+        // never silently coerced to `true` via "the variable is set at all".
+        // A silent-true here would be the actual security-relevant regression
+        // this test guards against: --insecure flipping on TLS verification
+        // skip because a script exported REDIS_TLS_INSECURE=0 meaning "off".
+        with_env_var("REDIS_TLS_INSECURE", "0", || {
+            assert!(
+                Cli::try_parse_from(["resque-bench"]).is_err(),
+                "REDIS_TLS_INSECURE=0 should be a parse error, not silently true"
+            );
+        });
+    }
+
+    #[test]
+    fn tls_env_var_false_resolves_to_false_not_presence_flag() {
+        // Same pattern, on the pre-existing --tls/REDIS_TLS flag this one is
+        // modeled on — confirms the existing behavior this PR relies on.
+        with_env_var("REDIS_TLS", "false", || {
+            let cli = Cli::try_parse_from(["resque-bench"]).expect("REDIS_TLS=false should parse");
+            assert!(!cli.tls, "REDIS_TLS=false must resolve to false, not true");
+        });
     }
 
     #[test]
