@@ -292,7 +292,11 @@ Internally
 this appends redis-rs's documented `#insecure` fragment to the connection URL
 (e.g. `rediss://host:6379/0#insecure`); the crate's `tls-rustls-insecure`
 feature (enabled in `Cargo.toml`) is what makes that fragment actually take
-effect, rather than being silently parsed and ignored.
+effect. Without the feature, redis-rs still parses the fragment (URL fragment
+parsing isn't feature-gated) but then refuses to connect at all, failing with
+`ErrorKind::InvalidClientConfig` ("Cannot create insecure client without
+tls-rustls-insecure feature") — it does not silently fall back to full
+certificate verification.
 
 **Warning:** `--insecure` disables verification of the server's identity —
 only use it against endpoints you trust, never over an untrusted network.
@@ -300,14 +304,19 @@ only use it against endpoints you trust, never over an untrusted network.
 **Behavior change / blast radius:** the `tls-rustls-insecure` Cargo feature
 is a build-time, crate-wide switch — it is not gated behind `--insecure` at
 runtime. Before this feature was enabled, a `--url` already carrying a
-`#insecure` fragment (e.g. `rediss://host:6379/0#insecure`) was silently
-*ignored* and the connection got full certificate verification regardless.
-Now that the feature is compiled in, that same pre-existing `#insecure`
-fragment takes effect automatically — certificate verification is skipped
-even if you never pass `--insecure` yourself. This is intentional (it's the
-whole point of the fix — see #7), but is worth calling out explicitly since
-it changes the security posture of any existing `--url`/`REDIS_URL` value
-that happened to carry that fragment.
+`#insecure` fragment (e.g. `rediss://host:6379/0#insecure`) still parsed
+successfully — but the connection attempt then hard-failed with
+`ErrorKind::InvalidClientConfig` ("Cannot create insecure client without
+tls-rustls-insecure feature"; see redis-1.5.0/src/connection.rs:1274-1279).
+There was no prior working configuration where that fragment was silently
+ignored and the connection succeeded with full certificate verification —
+it simply refused to connect at all. Now that the feature is compiled in,
+that same pre-existing `#insecure` fragment takes effect automatically —
+certificate verification is skipped even if you never pass `--insecure`
+yourself. This is intentional (it's the whole point of the fix — see #7),
+but is worth calling out explicitly: any existing `--url`/`REDIS_URL` value
+that happened to carry that fragment goes from refusing to connect at all
+to connecting successfully with verification skipped.
 
 ### Multi-queue mode
 
