@@ -15,7 +15,10 @@ path = "src/main.rs"
 # Redis client — plain RPUSH/LPOP, no blocking commands (matches Resque's real wire
 # protocol; see README "Protocol compatibility" for exact source citations).
 # tls-rustls-webpki-roots bundles Mozilla root CAs so TLS works without OS ca-certificates.
-redis = { version = "1", features = ["tokio-comp", "tokio-rustls-comp", "tls-rustls-webpki-roots"] }
+# tls-rustls-insecure enables the `rediss://host:port/#insecure` URL escape hatch
+# (used by --insecure) to skip certificate verification for self-signed/private-CA
+# certs — without this feature the #insecure fragment is silently a no-op.
+redis = { version = "1", features = ["tokio-comp", "tokio-rustls-comp", "tls-rustls-webpki-roots", "tls-rustls-insecure"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

@@ -260,6 +260,7 @@ cargo build --release
 | `--port` | — | — | Override port component of URL |
 | `--password` | `REDIS_PASSWORD` | — | Auth (prefer env var — CLI exposes it in `ps`) |
 | `--tls` | `REDIS_TLS` | false | Enable TLS (`rediss://`) |
+| `--insecure` | `REDIS_TLS_INSECURE` | false | Skip TLS certificate verification (only meaningful with `--tls` or a `rediss://` `--url`) — needed for self-signed/private-CA certs, e.g. test/staging/ephemeral deployments. **Warning:** disables verification of the server's identity; only use against endpoints you trust |
 | `--db` | — | `13` | Database number (not a Resque convention — chosen for parity with sidekiq-benchmark's safety default) |
 | `--workers` | — | `10,50,100,200` | Comma-separated concurrency levels — one trial each |
 | `--jobs` | — | `500000` | Total jobs per drain trial |
@@ -274,6 +275,24 @@ cargo build --release
 | `--allow-flushdb` | `RESQUE_BENCH_ALLOW_FLUSHDB` | false | FLUSHDB before each trial (default: DEL only the queue keys — safe on shared Redis) |
 | `--poll-interval-ms` | — | `5000` | Fixed poll interval between empty-queue LPOP retries. Matches Resque's own default (`worker.rb:252`, `interval = 5.0`) — see [Protocol compatibility](#protocol-compatibility) |
 | `--idle-poll-duration-s` | — | `30` | How long to run the idle-poll measurement phase after each trial's queue has drained |
+
+### TLS and certificate verification
+
+`--tls` upgrades the connection URL's scheme to `rediss://`. Against a server
+with a certificate signed by a public CA (or one your OS trust store already
+knows about), that's all you need.
+
+Against a server using a self-signed or private-CA certificate — the normal
+case for test/staging/ephemeral benchmark deployments — the TLS handshake
+will fail with a certificate verification error. Pass `--insecure` (or set
+`REDIS_TLS_INSECURE=1`) to skip server certificate verification. Internally
+this appends redis-rs's documented `#insecure` fragment to the connection URL
+(e.g. `rediss://host:6379/0#insecure`); the crate's `tls-rustls-insecure`
+feature (enabled in `Cargo.toml`) is what makes that fragment actually take
+effect, rather than being silently parsed and ignored.
+
+**Warning:** `--insecure` disables verification of the server's identity —
+only use it against endpoints you trust, never over an untrusted network.
 
 ### Multi-queue mode
 

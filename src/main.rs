@@ -41,6 +41,17 @@ struct Cli {
     #[arg(long, env = "REDIS_TLS")]
     tls: bool,
 
+    /// Skip TLS server certificate verification (only meaningful with --tls, or
+    /// a rediss:// --url). Required to connect to servers using self-signed or
+    /// private-CA certs — the normal case for test/staging/ephemeral benchmark
+    /// deployments. Implemented via redis-rs's documented
+    /// `rediss://host:port/#insecure` URL escape hatch (see Cargo.toml — this
+    /// requires the `tls-rustls-insecure` feature to actually take effect).
+    /// WARNING: disables verification of the server's identity — only use this
+    /// against endpoints you trust, never over an untrusted network.
+    #[arg(long, env = "REDIS_TLS_INSECURE")]
+    insecure: bool,
+
     /// Redis database number. When omitted, the db in --url is used, falling back to 13
     /// (the Ruby sidekiqload safety default). Note db > 0 does not exist on Redis Cluster
     /// or most managed Redis, so `--db 0` is usually required against those.
@@ -132,6 +143,18 @@ fn build_redis_url(cli: &Cli) -> Result<String> {
     if cli.tls && u.scheme() == "redis" {
         u.set_scheme("rediss")
             .map_err(|_| anyhow::anyhow!("cannot upgrade scheme to rediss"))?;
+    }
+    if cli.insecure {
+        anyhow::ensure!(
+            u.scheme() == "rediss",
+            "--insecure requires TLS: pass --tls (or use a rediss:// --url)"
+        );
+        // redis-rs's documented escape hatch: a `#insecure` fragment on a
+        // rediss:// URL disables server certificate verification, but only
+        // does anything when the crate is built with the tls-rustls-insecure
+        // feature (see Cargo.toml) — otherwise it is silently parsed and
+        // ignored, which was the root cause of this flag not existing before.
+        u.set_fragment(Some("insecure"));
     }
     if let Some(password) = &cli.password {
         // url::Url::set_password percent-encodes special characters (e.g. '@', '/', ':').
@@ -944,6 +967,7 @@ mod tests {
             port: None,
             password: None,
             tls: false,
+            insecure: false,
             db: Some(0),
             workers: vec![10],
             jobs: 1000,
@@ -1014,6 +1038,41 @@ mod tests {
         cli.tls = true;
         let url = build_redis_url(&cli).unwrap();
         assert!(url.starts_with("rediss://"), "expected rediss:// got {url}");
+    }
+
+    #[test]
+    fn build_redis_url_insecure_appends_fragment_with_tls() {
+        let mut cli = base_cli();
+        cli.tls = true;
+        cli.insecure = true;
+        let url = build_redis_url(&cli).unwrap();
+        assert!(url.starts_with("rediss://"), "expected rediss:// got {url}");
+        assert!(
+            url.ends_with("#insecure"),
+            "expected #insecure fragment, got {url}"
+        );
+    }
+
+    #[test]
+    fn build_redis_url_insecure_works_with_rediss_url_without_tls_flag() {
+        let mut cli = base_cli();
+        cli.url = "rediss://127.0.0.1:6379/0".into();
+        cli.insecure = true;
+        let url = build_redis_url(&cli).unwrap();
+        assert!(
+            url.ends_with("#insecure"),
+            "expected #insecure fragment, got {url}"
+        );
+    }
+
+    #[test]
+    fn build_redis_url_insecure_without_tls_is_rejected() {
+        let mut cli = base_cli();
+        cli.insecure = true;
+        assert!(
+            build_redis_url(&cli).is_err(),
+            "--insecure without --tls (or a rediss:// URL) should be an error, not a silent no-op"
+        );
     }
 
     #[test]
